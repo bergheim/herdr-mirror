@@ -196,6 +196,9 @@ struct Frame {
     height: Option<usize>,
     bytes: Option<String>,
     reason: Option<String>,
+    /// `terminal.keyboard`: the remote application's keyboard protocol
+    flags: Option<u16>,
+    modify_other_keys_level: Option<u8>,
 }
 
 enum Msg {
@@ -453,6 +456,39 @@ fn write_stdout(s: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes());
     let _ = out.flush();
+}
+
+/// Kitty keyboard flags and xterm modifyOtherKeys level of a terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeyboardMode {
+    kitty_flags: u16,
+    modify_other_keys: u8,
+}
+
+/// Escape sequence moving a terminal from one keyboard mode to another — the
+/// same transitions herdr writes to its host terminal for a direct attach.
+fn keyboard_mode_escape(from: KeyboardMode, to: KeyboardMode) -> String {
+    let mut out = String::new();
+    if from.kitty_flags != to.kitty_flags {
+        if from.kitty_flags != 0 {
+            out.push_str("\x1b[<1u");
+        }
+        if to.kitty_flags != 0 {
+            out.push_str(&format!("\x1b[>{}u", to.kitty_flags));
+        }
+    }
+    if from.modify_other_keys != to.modify_other_keys {
+        out.push_str(&format!("\x1b[>4;{}m", to.modify_other_keys));
+    }
+    out
+}
+
+/// A ctrl key in legacy form, or as a Kitty press (`CSI code;5u`, with or
+/// without the `:1` event type) while the pane mirrors a Kitty mode.
+fn is_ctrl_key(buf: &[u8], legacy: u8, codepoint: u32) -> bool {
+    buf == [legacy]
+        || buf == format!("\x1b[{codepoint};5u").as_bytes()
+        || buf == format!("\x1b[{codepoint};5:1u").as_bytes()
 }
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
@@ -806,6 +842,11 @@ struct App {
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
+    /// keyboard protocol the local pane is held in, matching the remote
+    /// application's (`terminal.keyboard`): input is forwarded byte for byte,
+    /// so local herdr must already encode keys the way that application
+    /// decodes them (#107)
+    keyboard: KeyboardMode,
     paste_inflight: bool,
     /// partially-received bracketed paste (see `intercept_paste`)
     paste_buf: Vec<u8>,
@@ -968,6 +1009,14 @@ impl App {
         write_stdout(if want { "\x1b[?1h" } else { "\x1b[?1l" });
     }
 
+    fn sync_keyboard_mode(&mut self, want: KeyboardMode) {
+        if !self.tty || want == self.keyboard {
+            return;
+        }
+        write_stdout(&keyboard_mode_escape(self.keyboard, want));
+        self.keyboard = want;
+    }
+
     fn observe_size(&self) -> (usize, usize) {
         observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) })
     }
@@ -985,6 +1034,9 @@ impl App {
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
     fn stop_session(&mut self) {
+        // only a control session reports the remote keyboard mode; until the
+        // next one does, legacy is the safe guess
+        self.sync_keyboard_mode(KeyboardMode::default());
         if let Some(mut s) = self.session.take() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
@@ -1098,6 +1150,13 @@ impl App {
             self.paint();
             return;
         }
+        if frame.kind == "terminal.keyboard" {
+            self.sync_keyboard_mode(KeyboardMode {
+                kitty_flags: frame.flags.unwrap_or(0),
+                modify_other_keys: frame.modify_other_keys_level.unwrap_or(0),
+            });
+            return;
+        }
         if frame.kind != "terminal.frame" {
             return;
         }
@@ -1144,6 +1203,7 @@ impl App {
             return; // an old child we already replaced/killed
         }
         self.session = None;
+        self.sync_keyboard_mode(KeyboardMode::default());
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
         // control that dies quickly twice is failing (refused/dropped): fall
@@ -1306,7 +1366,7 @@ impl App {
     }
 
     async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
-        if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+        if is_ctrl_key(&buf, 0x16, 'v' as u32) && !self.paste_inflight {
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
@@ -1344,7 +1404,7 @@ impl App {
 
         // control mode
         self.last_input = Instant::now();
-        if buf.len() == 1 && buf[0] == 0x1c {
+        if is_ctrl_key(&buf, 0x1c, '\\' as u32) {
             // ctrl+\ — manual release. In always-control there's nothing to
             // release to, so swallow it (never forward it: ctrl+\ is SIGQUIT).
             if !self.args.always_control {
@@ -1637,6 +1697,7 @@ pub async fn run(args: Args) -> Result<()> {
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
+        keyboard: KeyboardMode::default(),
         paste_inflight: false,
         paste_buf: Vec::new(),
         mouse_buf: Vec::new(),
@@ -1795,7 +1856,8 @@ pub async fn run(args: Args) -> Result<()> {
         // would misencode arrows for whatever runs there next
         // 1007 back on: it is a default-on mode we turned off, so leaving it
         // clear would silently change the wheel for whatever runs in this pane
-        // after the streamer exits
+        // after the streamer exits. Same for a mirrored keyboard protocol.
+        write_stdout(&keyboard_mode_escape(app.keyboard, KeyboardMode::default()));
         write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
@@ -1807,6 +1869,29 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_mode_escape_pushes_pops_and_sets_modify_other_keys() {
+        let legacy = KeyboardMode::default();
+        let kitty = KeyboardMode { kitty_flags: 7, modify_other_keys: 0 };
+        let mok = KeyboardMode { kitty_flags: 0, modify_other_keys: 2 };
+        assert_eq!(keyboard_mode_escape(legacy, legacy), "");
+        assert_eq!(keyboard_mode_escape(legacy, kitty), "\x1b[>7u");
+        assert_eq!(keyboard_mode_escape(kitty, KeyboardMode { kitty_flags: 1, ..kitty }), "\x1b[<1u\x1b[>1u");
+        assert_eq!(keyboard_mode_escape(kitty, legacy), "\x1b[<1u");
+        assert_eq!(keyboard_mode_escape(legacy, mok), "\x1b[>4;2m");
+        assert_eq!(keyboard_mode_escape(mok, legacy), "\x1b[>4;0m");
+    }
+
+    #[test]
+    fn ctrl_keys_match_legacy_and_kitty_presses_only() {
+        assert!(is_ctrl_key(b"\x16", 0x16, 'v' as u32));
+        assert!(is_ctrl_key(b"\x1b[118;5u", 0x16, 'v' as u32));
+        assert!(is_ctrl_key(b"\x1b[118;5:1u", 0x16, 'v' as u32));
+        assert!(!is_ctrl_key(b"\x1b[118;5:3u", 0x16, 'v' as u32)); // release
+        assert!(!is_ctrl_key(b"v", 0x16, 'v' as u32));
+        assert!(is_ctrl_key(b"\x1b[92;5u", 0x1c, '\\' as u32));
+    }
 
     #[tokio::test]
     async fn pane_transport_cleanup_terminates_proxy_command() {
@@ -2365,6 +2450,7 @@ mod tests {
             // startup leaves the pane in normal cursor mode; the first classification
             // moves it if the remote turns out to be a TUI
             app_cursor_keys: false,
+            keyboard: KeyboardMode::default(),
             paste_inflight: false,
             paste_buf: Vec::new(),
             mouse_buf: Vec::new(),
